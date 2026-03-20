@@ -1,0 +1,42 @@
+# Docker Compose v2+ (no requiere la directiva 'version' obsoleta)
+# Para construir con BuildKit habilitado ejecutar:
+#   DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 docker compose build
+# O en Docker Compose v1:
+#   DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 docker-compose build
+services:
+  db:
+    image: docker.io/postgres:16
+    restart: unless-stopped
+    volumes:
+      - ./data/db:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: paperless
+      POSTGRES_USER: paperless
+      POSTGRES_PASSWORD: paperless_password
+
+  webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paperless_custom
+    restart: unless-stopped
+    depends_on:
+      - db
+      - broker
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/data:/usr/src/paperless/data
+      - ./data/media:/usr/src/paperless/media
+      - ./consume:/usr/src/paperless/consume
+      - ./export:/usr/src/paperless/export
+    env_file: docker-compose.env
+    environment:
+      PAPERLESS_REDIS: redis://broker:6379
+      PAPERLESS_DBHOST: db
+      # Database credentials matches POSTGRES_PASSWORD in db
+      PAPERLESS_DBPASS: paperless_password
+
+  broker:
+    image: docker.io/library/redis:7
+    restart: unless-stopped
