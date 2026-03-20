@@ -1,0 +1,301 @@
+import grp
+import os
+import pwd
+import shutil
+import stat
+from pathlib import Path
+
+from django.conf import settings
+from django.core.checks import Error
+from django.core.checks import Tags
+from django.core.checks import Warning
+from django.core.checks import register
+from django.db import connections
+
+exists_message = "{} is set but doesn't exist."
+exists_hint = "Create a directory at {}"
+writeable_message = "{} is not writeable"
+writeable_hint = (
+    "Set the permissions of {} to be writeable by the user running the "
+    "Paperless services"
+)
+
+
+def path_check(var, directory: Path) -> list[Error]:
+    messages: list[Error] = []
+    if directory:
+        if not directory.is_dir():
+            messages.append(
+                Error(exists_message.format(var), exists_hint.format(directory)),
+            )
+        else:
+            test_file: Path = directory / f"__paperless_write_test_{os.getpid()}__"
+            try:
+                with test_file.open("w"):
+                    pass
+            except PermissionError:
+                dir_stat: os.stat_result = Path(directory).stat()
+                dir_mode: str = stat.filemode(dir_stat.st_mode)
+                dir_owner: str = pwd.getpwuid(dir_stat.st_uid).pw_name
+                dir_group: str = grp.getgrgid(dir_stat.st_gid).gr_name
+                messages.append(
+                    Error(
+                        writeable_message.format(var),
+                        writeable_hint.format(
+                            f"\n{dir_mode} {dir_owner} {dir_group} {directory}\n",
+                        ),
+                    ),
+                )
+            finally:
+                try:
+                    if test_file.is_file():
+                        test_file.unlink()
+                except (PermissionError, OSError):
+                    # Skip cleanup if we can't access the file — expected in permission tests
+                    pass
+
+    return messages
+
+
+@register()
+def paths_check(app_configs, **kwargs) -> list[Error]:
+    """
+    Check the various paths for existence, readability and writeability
+    """
+
+    return (
+        path_check("PAPERLESS_DATA_DIR", settings.DATA_DIR)
+        + path_check("PAPERLESS_EMPTY_TRASH_DIR", settings.EMPTY_TRASH_DIR)
+        + path_check("PAPERLESS_MEDIA_ROOT", settings.MEDIA_ROOT)
+        + path_check("PAPERLESS_CONSUMPTION_DIR", settings.CONSUMPTION_DIR)
+    )
+
+
+@register()
+def binaries_check(app_configs, **kwargs):
+    """
+    Paperless requires the existence of a few binaries, so we do some checks
+    for those here.
+    """
+
+    error = "Paperless can't find {}. Without it, consumption is impossible."
+    hint = "Either it's not in your ${PATH} or it's not installed."
+
+    binaries = (settings.CONVERT_BINARY, "tesseract", "gs")
+
+    check_messages = []
+    for binary in binaries:
+        if shutil.which(binary) is None:
+            check_messages.append(Warning(error.format(binary), hint))
+
+    return check_messages
+
+
+@register()
+def debug_mode_check(app_configs, **kwargs):
+    if settings.DEBUG:
+        return [
+            Warning(
+                "DEBUG mode is enabled. Disable Debug mode. This is a serious "
+                "security issue, since it puts security overrides in place "
+                "which are meant to be only used during development. This "
+                "also means that paperless will tell anyone various "
+                "debugging information when something goes wrong.",
+            ),
+        ]
+    else:
+        return []
+
+
+@register()
+def settings_values_check(app_configs, **kwargs):
+    """
+    Validates at least some of the user provided settings
+    """
+
+    def _ocrmypdf_settings_check():
+        """
+        Validates some of the arguments which will be provided to ocrmypdf
+        against the valid options.  Use "ocrmypdf --help" to see the valid
+        inputs
+        """
+        msgs = []
+        if settings.OCR_OUTPUT_TYPE not in {
+            "pdfa",
+            "pdf",
+            "pdfa-1",
+            "pdfa-2",
+            "pdfa-3",
+        }:
+            msgs.append(
+                Error(f'OCR output type "{settings.OCR_OUTPUT_TYPE}" is not valid'),
+            )
+
+        if settings.OCR_MODE not in {"force", "skip", "redo", "skip_noarchive"}:
+            msgs.append(Error(f'OCR output mode "{settings.OCR_MODE}" is not valid'))
+
+        if settings.OCR_MODE == "skip_noarchive":
+            msgs.append(
+                Warning(
+                    'OCR output mode "skip_noarchive" is deprecated and will be '
+                    "removed in a future version. Please use "
+                    "PAPERLESS_OCR_SKIP_ARCHIVE_FILE instead.",
+                ),
+            )
+
+        if settings.OCR_SKIP_ARCHIVE_FILE not in {"never", "with_text", "always"}:
+            msgs.append(
+                Error(
+                    "OCR_SKIP_ARCHIVE_FILE setting "
+                    f'"{settings.OCR_SKIP_ARCHIVE_FILE}" is not valid',
+                ),
+            )
+
+        if settings.OCR_CLEAN not in {"clean", "clean-final", "none"}:
+            msgs.append(Error(f'OCR clean mode "{settings.OCR_CLEAN}" is not valid'))
+        return msgs
+
+    def _timezone_validate():
+        """
+        Validates the user provided timezone is a valid timezone
+        """
+        import zoneinfo
+
+        msgs = []
+        if settings.TIME_ZONE not in zoneinfo.available_timezones():
+            msgs.append(
+                Error(f'Timezone "{settings.TIME_ZONE}" is not a valid timezone'),
+            )
+        return msgs
+
+    def _email_certificate_validate():
+        msgs = []
+        # Existence checks
+        if (
+            settings.EMAIL_CERTIFICATE_FILE is not None
+            and not settings.EMAIL_CERTIFICATE_FILE.is_file()
+        ):
+            msgs.append(
+                Error(
+                    f"Email cert {settings.EMAIL_CERTIFICATE_FILE} is not a file",
+                ),
+            )
+        return msgs
+
+    return (
+        _ocrmypdf_settings_check()
+        + _timezone_validate()
+        + _email_certificate_validate()
+    )
+
+
+@register()
+def audit_log_check(app_configs, **kwargs):
+    db_conn = connections["default"]
+    all_tables = db_conn.introspection.table_names()
+    result = []
+
+    if ("auditlog_logentry" in all_tables) and not settings.AUDIT_LOG_ENABLED:
+        result.append(
+            Warning(
+                ("auditlog table was found but audit log is disabled."),
+            ),
+        )
+
+    return result
+
+
+@register(Tags.compatibility)
+def check_v3_minimum_upgrade_version(
+    app_configs: object,
+    **kwargs: object,
+) -> list[Error]:
+    """
+    Enforce that upgrades to v3 must start from v2.20.10.
+
+    v3 squashes all prior migrations into 0001_squashed and 0002_squashed.
+    If a user skips v2.20.10, the data migration in 1075_workflowaction_order
+    never runs and the squash may apply schema changes against an incomplete
+    database state.
+    """
+    from django.db import DatabaseError
+    from django.db import OperationalError
+
+    try:
+        all_tables = connections["default"].introspection.table_names()
+
+        if "django_migrations" not in all_tables:
+            return []
+
+        with connections["default"].cursor() as cursor:
+            cursor.execute(
+                "SELECT name FROM django_migrations WHERE app = %s",
+                ["documents"],
+            )
+            applied: set[str] = {row[0] for row in cursor.fetchall()}
+
+        if not applied:
+            return []
+
+        # Already in a valid v3 state
+        if {"0001_squashed", "0002_squashed"} & applied:
+            return []
+
+        # On v2.20.10 exactly — squash will pick up cleanly from here
+        if "1075_workflowaction_order" in applied:
+            return []
+
+    except (DatabaseError, OperationalError):
+        return []
+
+    return [
+        Error(
+            "Cannot upgrade to Paperless-ngx v3 from this version.",
+            hint=(
+                "Upgrading to v3 can only be performed from v2.20.10."
+                "Please upgrade to v2.20.10, run migrations, then upgrade to v3."
+                "See https://docs.paperless-ngx.com/setup/#upgrading for details."
+            ),
+            id="paperless.E002",
+        ),
+    ]
+
+
+@register()
+def check_deprecated_db_settings(
+    app_configs: object,
+    **kwargs: object,
+) -> list[Warning]:
+    """Check for deprecated database environment variables.
+
+    Detects legacy advanced options that should be migrated to
+    PAPERLESS_DB_OPTIONS. Returns one Warning per deprecated variable found.
+    """
+    deprecated_vars: dict[str, str] = {
+        "PAPERLESS_DB_TIMEOUT": "timeout",
+        "PAPERLESS_DB_POOLSIZE": "pool.min_size / pool.max_size",
+        "PAPERLESS_DBSSLMODE": "sslmode",
+        "PAPERLESS_DBSSLROOTCERT": "sslrootcert",
+        "PAPERLESS_DBSSLCERT": "sslcert",
+        "PAPERLESS_DBSSLKEY": "sslkey",
+    }
+
+    warnings: list[Warning] = []
+
+    for var_name, db_option_key in deprecated_vars.items():
+        if not os.getenv(var_name):
+            continue
+        warnings.append(
+            Warning(
+                f"Deprecated environment variable: {var_name}",
+                hint=(
+                    f"{var_name} is no longer supported and will be removed in v3.2. "
+                    f"Set the equivalent option via PAPERLESS_DB_OPTIONS instead. "
+                    f'Example: PAPERLESS_DB_OPTIONS=\'{{"{db_option_key}": "<value>"}}\'. '
+                    "See https://docs.paperless-ngx.com/migration/ for the full reference."
+                ),
+                id="paperless.W001",
+            ),
+        )
+
+    return warnings
